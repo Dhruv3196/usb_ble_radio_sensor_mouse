@@ -34,42 +34,6 @@
 #include "radio_config.h"
 #include "nrfx_clock.h"
 
-#include "sensor_func.h"
-
-#define SLEEP_TIME_MS 100
-#define SPIOP SPI_WORD_SET(8) | SPI_TRANSFER_MSB | SPI_MODE_CPOL | SPI_MODE_CPHA // If CPOL is set -> CPOL=1 otherwise 0, same for CPHA
-#define MOTION_NODE DT_ALIAS(sw7)
-
-int64_t volatile Time_read = 0;
-int64_t volatile Time_write = 0;
-bool volatile flag_write = false;
-int8_t volatile flag_cb = 0;
-uint8_t temp_x;
-uint8_t temp_y;
-
-static struct gpio_dt_spec const led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static struct gpio_dt_spec const motion_pin = GPIO_DT_SPEC_GET(MOTION_NODE, gpios);
-static struct gpio_dt_spec const print_pin = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-struct gpio_dt_spec const ncs_pin = GPIO_DT_SPEC_GET(DT_ALIAS(ncs), gpios);
-static struct gpio_dt_spec const nreset_pin = GPIO_DT_SPEC_GET(DT_ALIAS(nreset), gpios);
-struct spi_dt_spec const spispec = SPI_DT_SPEC_GET(DT_NODELABEL(paw3395), SPIOP, 0);
-// struct motion_burst volatile MotionBurstData;
-
-extern long get_time(void);
-extern int paw_read_regs(uint8_t reg, uint8_t *pdata, uint8_t size);
-extern int paw_write_reg(uint16_t add, uint8_t data);
-extern int update_values_motion_burst(void);
-extern void CPI_set(uint16_t resolution_x, uint16_t resolution_y);
-extern void power_up_init_reg(void);
-
-extern bool burst;
-
-uint16_t resolution_x = 100;
-uint16_t resolution_y = 100;
-uint8_t value[12];
-uint16_t del_x = 0;
-uint16_t del_y = 0;
-
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
@@ -105,40 +69,11 @@ const struct device *const qdec_dev = DEVICE_DT_GET(DT_ALIAS(qdec0));
 static uint8_t report_ble[INPUT_REP_BUTTONS_LEN] = {0};
 static uint8_t report_usb[4] = {0};
 static bool report_updated = false;
-// static bool bt_active = true;
+static bool bt_active = true;
 static const uint8_t hid_report_desc[] = HID_MOUSE_REPORT_DESC(5);
 static enum usb_dc_status_code usb_status;
 const struct device *hid_dev;
 static uint32_t packet = 0;
-
-static bool usb_mode = false; // Start with USB mode
-static bool bt_mode = true;
-static bool radio_mode = false;
-
-static void power_up_sequence(void)
-{
-	k_msleep(50);
-	gpio_pin_set_dt(&ncs_pin, 1);
-	k_msleep(10);
-	gpio_pin_set_dt(&ncs_pin, 0);
-	paw_write_reg(POWER_UP_RESET_REG, 0x5A);
-	k_msleep(5);
-	power_up_init_reg();
-	uint8_t value[1];
-	for (uint8_t i = 0x02; i <= 0x06; i++)
-	{
-		paw_read_regs(i, value, 1);
-	}
-
-	gpio_pin_set_dt(&nreset_pin, 1);
-	k_usleep(10);
-	gpio_pin_set_dt(&nreset_pin, 0);
-}
-
-ALWAYS_INLINE uint16_t complement(uint16_t x)
-{
-	return ((~x) + 1);
-}
 
 static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
 {
@@ -191,12 +126,6 @@ void clock_init()
 	nrfx_clock_lfclk_start();
 	while (!nrfx_clock_lfclk_is_running())
 		;
-}
-
-void clock_deinit()
-{
-	nrfx_clock_hfclk_stop();
-	nrfx_clock_lfclk_stop();
 }
 
 #if CONFIG_BT_DIRECTED_ADVERTISING
@@ -314,7 +243,7 @@ static void advertising_continue(void)
 
 static void advertising_start(void)
 {
-	if (!bt_mode)
+	if (!bt_active)
 	{
 		printk("Bluetooth is stopped, not starting advertising.\n");
 		return;
@@ -662,6 +591,225 @@ static void num_comp_reply(bool accept)
 	}
 }
 
+static void usb_status_cb(enum usb_dc_status_code status, const uint8_t *param)
+{
+	usb_status = status;
+
+	switch (status)
+	{
+	case USB_DC_CONFIGURED:
+		printk("USB device configured\n");
+		break;
+	case USB_DC_SUSPEND:
+		printk("USB device suspended\n");
+		break;
+	case USB_DC_RESUME:
+		printk("USB device resumed\n");
+		break;
+	case USB_DC_RESET:
+		printk("USB device reset detected\n");
+		break;
+	case USB_DC_ERROR:
+		printk("USB device error\n");
+		break;
+	default:
+		printk("Unknown USB device state: %d\n", status);
+		break;
+	}
+}
+
+static bool usb_mode = false; // Start with USB mode
+static bool bt_mode = true;
+static bool radio_mode = false;
+
+static void usb_hid_init_new(void)
+{
+	hid_dev = device_get_binding("HID_0");
+	if (hid_dev == NULL)
+	{
+		printk("Cannot get USB HID Device\n");
+		return;
+	}
+
+	usb_hid_register_device(hid_dev,
+							hid_report_desc, sizeof(hid_report_desc),
+							NULL);
+	usb_hid_init(hid_dev);
+	int ret = usb_enable(usb_status_cb);
+	if (ret != 0)
+	{
+		printk("Failed to enable USB: %d\n", ret);
+	}
+}
+
+static void input_cb(struct input_event *evt)
+{
+	//printk("Event received: code=%d, value=%d\n", evt->code, evt->value);
+
+	if (evt->value == 1) // Key pressed
+	{
+		if (evt->code == INPUT_KEY_4)
+		{
+			if (!usb_mode)
+			{
+				bt_mode = false;
+				radio_mode = false;
+				usb_mode = true;
+				// Turn off Bluetooth and radio
+				for (size_t j = 0; j < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; j++)
+				{
+					if (conn_mode[j].conn)
+					{
+						bt_conn_disconnect(conn_mode[j].conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+					}
+				}
+				bt_le_adv_stop();
+				// Initialize USB HID
+				usb_hid_init_new();
+				printk("Switched to USB mode\n");
+			}
+		}
+		else if (evt->code == INPUT_KEY_5)
+		{
+			if (!bt_mode)
+			{
+				usb_mode = false;
+				radio_mode = false;
+				bt_mode = true;
+				// Turn off USB
+				if (usb_disable() != 0)
+				{
+					printk("Failed to disable USB\n");
+				}
+				// Reinitialize Bluetooth and start advertising
+				advertising_start();
+				printk("Switched to Bluetooth mode\n");
+			}
+		}
+		else if (evt->code == INPUT_KEY_6)
+		{
+			if (!radio_mode)
+			{
+				usb_mode = false;
+				bt_mode = false;
+				radio_mode = true;
+				// Turn off USB and Bluetooth
+				for (size_t j = 0; j < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; j++)
+				{
+					if (conn_mode[j].conn)
+					{
+						bt_conn_disconnect(conn_mode[j].conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+					}
+				}
+				bt_le_adv_stop();
+				if (usb_disable() != 0)
+				{
+					printk("Failed to disable USB\n");
+				}
+				// Initialize radio
+				clock_init();
+				radio_configure();
+				printk("Switched to radio mode\n");
+			}
+		}
+	}
+	else
+	{
+		switch (evt->code)
+		{
+		case INPUT_KEY_0:
+			WRITE_BIT(report_usb[0], 0, evt->value);
+			WRITE_BIT(report_ble[0], 0, evt->value);
+			if (evt->value == 1)
+			{
+				packet = 4;
+			}
+			else if (evt->value == 0)
+			{
+				packet = 3;
+			}
+			report_updated = true;
+			break;
+		case INPUT_KEY_1:
+			WRITE_BIT(report_usb[0], 1, evt->value); // Right mouse button for USB
+			WRITE_BIT(report_ble[0], 1, evt->value);
+			if (evt->value == 1)
+			{
+				packet = 6;
+			}
+			else if (evt->value == 0)
+			{
+				packet = 5;
+			} // Right mouse button for BLE
+			report_updated = true;
+			break;
+		case INPUT_KEY_2:
+			num_comp_reply(true); // Confirm pairing
+			break;
+		case INPUT_KEY_3:
+			num_comp_reply(false); // Reject pairing
+			break;
+		default:
+			return;
+		}
+	}
+}
+
+static void qdec_fetch_and_handle(void)
+{
+	struct sensor_value val;
+	int rc;
+
+	rc = sensor_sample_fetch(qdec_dev);
+	if (rc != 0)
+	{
+		printk("Failed to fetch QDEC sample (%d)\n", rc);
+		return;
+	}
+
+	rc = sensor_channel_get(qdec_dev, 35, &val);
+	if (rc != 0)
+	{
+		printk("Failed to get QDEC data (%d)\n", rc);
+		return;
+	}
+
+	if (val.val1 > 0)
+	{
+		if (bt_mode)
+		{
+			report_ble[1] = 5;
+		}
+		else if (usb_mode)
+		{
+			report_usb[3] += 5;
+		}
+		else if (radio_mode)
+		{
+			packet = 2;
+		}
+		report_updated = true;
+	}
+	else if (val.val1 < 0)
+	{
+		if (bt_mode)
+		{
+			report_ble[1] = -5;
+		}
+		else if (usb_mode)
+		{
+			report_usb[3] -= 5;
+		}
+		else if (radio_mode)
+		{
+			packet = 1;
+		}
+		report_updated = true;
+	}
+}
+
+INPUT_CALLBACK_DEFINE(NULL, input_cb);
+
 #if defined(CONFIG_BT_HIDS_SECURITY_ENABLED)
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
@@ -752,301 +900,68 @@ static struct bt_conn_auth_cb conn_auth_callbacks;
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
 #endif /* defined(CONFIG_BT_HIDS_SECURITY_ENABLED) */
 
-static void usb_status_cb(enum usb_dc_status_code status, const uint8_t *param)
+static void bas_notify(void)
 {
-	usb_status = status;
+	uint8_t battery_level = bt_bas_get_battery_level();
 
-	switch (status)
-	{
-	case USB_DC_CONFIGURED:
-		printk("USB device configured\n");
-		break;
-	case USB_DC_SUSPEND:
-		printk("USB device suspended\n");
-		break;
-	case USB_DC_RESUME:
-		printk("USB device resumed\n");
-		break;
-	case USB_DC_RESET:
-		printk("USB device reset detected\n");
-		break;
-	case USB_DC_ERROR:
-		printk("USB device error\n");
-		break;
-	default:
-		printk("Unknown USB device state: %d\n", status);
-		break;
-	}
-}
+	// battery_level--;
 
-static void usb_hid_init_new(void)
-{
-	hid_dev = device_get_binding("HID_0");
-	if (hid_dev == NULL)
+	if (!battery_level)
 	{
-		printk("Cannot get USB HID Device\n");
-		return;
+		battery_level = 100U;
 	}
 
-	usb_hid_register_device(hid_dev,
-							hid_report_desc, sizeof(hid_report_desc),
-							NULL);
-	usb_hid_init(hid_dev);
-	int ret = usb_enable(usb_status_cb);
-	if (ret != 0)
-	{
-		printk("Failed to enable USB: %d\n", ret);
-	}
-}
-
-static void input_cb(struct input_event *evt)
-{
-	if (evt->value == 1) // Key pressed
-	{
-		if (evt->code == INPUT_KEY_4)
-		{
-			if (!usb_mode)
-			{
-				bt_mode = false;
-				if (radio_mode)
-					clock_deinit();
-				radio_mode = false;
-				usb_mode = true;
-				// Turn off Bluetooth and radio
-
-				for (size_t j = 0; j < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; j++)
-				{
-					if (conn_mode[j].conn)
-					{
-						bt_conn_auth_cancel(conn_mode[j].conn);
-						bt_conn_auth_info_cb_unregister(conn_mode[j].conn);
-						bt_conn_disconnect(conn_mode[j].conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-					}
-				}
-				bt_le_adv_stop();
-				// Initialize USB HID
-				// clock_deinit();
-				usb_hid_init_new();
-				printk("Switched to USB mode\n");
-			}
-		}
-		else if (evt->code == INPUT_KEY_5)
-		{
-			if (!bt_mode)
-			{
-				usb_mode = false;
-				if (radio_mode)
-					clock_deinit();
-				radio_mode = false;
-				bt_mode = true;
-				// Turn off USB
-				if (usb_disable() != 0)
-				{
-					printk("Failed to disable USB\n");
-				}
-				// Reinitialize Bluetooth and start advertising
-				clock_deinit();
-
-				advertising_start();
-				// advertising_start();
-				printk("Switched to Bluetooth mode\n");
-			}
-		}
-		else if (evt->code == INPUT_KEY_6)
-		{
-			if (!radio_mode)
-			{
-				usb_mode = false;
-				bt_mode = false;
-				radio_mode = true;
-				clock_deinit();
-				k_msleep(100);
-				// Turn off USB and Bluetooth
-				for (size_t j = 0; j < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; j++)
-				{
-					if (conn_mode[j].conn)
-					{
-						bt_conn_auth_cancel(conn_mode[j].conn);
-						bt_conn_auth_info_cb_unregister(conn_mode[j].conn);
-						bt_conn_disconnect(conn_mode[j].conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-					}
-				}
-				bt_le_adv_stop();
-				k_msleep(100);
-				if (usb_disable() != 0)
-				{
-					printk("Failed to disable USB\n");
-				}
-				k_msleep(100);
-				// Initialize radio
-				clock_init();
-				radio_configure();
-				printk("Switched to radio mode\n");
-			}
-		}
-	}
-
-	switch (evt->code)
-	{
-	case INPUT_KEY_0:
-		WRITE_BIT(report_usb[0], 0, evt->value);
-		WRITE_BIT(report_ble[0], 0, evt->value);
-		if (evt->value == 1)
-		{
-			packet = 4;
-		}
-		else if (evt->value == 0)
-		{
-			packet = 3;
-		}
-		report_updated = true;
-		break;
-	case INPUT_KEY_1:
-		WRITE_BIT(report_usb[0], 1, evt->value); // Right mouse button for USB
-		WRITE_BIT(report_ble[0], 1, evt->value);
-		if (evt->value == 1)
-		{
-			packet = 6;
-		}
-		else if (evt->value == 0)
-		{
-			packet = 5;
-		} // Right mouse button for BLE
-		report_updated = true;
-		break;
-	case INPUT_KEY_2:
-		num_comp_reply(true); // Confirm pairing
-		break;
-	case INPUT_KEY_3:
-		num_comp_reply(false); // Reject pairing
-		break;
-	default:
-		return;
-	}
-}
-
-static void qdec_fetch_and_handle(void)
-{
-	struct sensor_value val;
-	int rc;
-
-	rc = sensor_sample_fetch(qdec_dev);
-	if (rc != 0)
-	{
-		printk("Failed to fetch QDEC sample (%d)\n", rc);
-		return;
-	}
-
-	rc = sensor_channel_get(qdec_dev, 35, &val);
-	if (rc != 0)
-	{
-		printk("Failed to get QDEC data (%d)\n", rc);
-		return;
-	}
-
-	if (val.val1 > 0)
-	{
-		if (bt_mode)
-		{
-			report_ble[1] = 5;
-		}
-		else if (usb_mode)
-		{
-			report_usb[3] += 5;
-		}
-		else if (radio_mode)
-		{
-			packet = 2;
-		}
-		report_updated = true;
-	}
-	else if (val.val1 < 0)
-	{
-		if (bt_mode)
-		{
-			report_ble[1] = -5;
-		}
-		else if (usb_mode)
-		{
-			report_usb[3] -= 5;
-		}
-		else if (radio_mode)
-		{
-			packet = 1;
-		}
-		report_updated = true;
-	}
-}
-
-INPUT_CALLBACK_DEFINE(NULL, input_cb);
-
-// static void bas_notify(void)
-// {
-// 	uint8_t battery_level = bt_bas_get_battery_level();
-
-// 	// battery_level--;
-
-// 	if (!battery_level)
-// 	{
-// 		battery_level = 100U;
-// 	}
-
-// 	bt_bas_set_battery_level(battery_level);
-// }
-
-void cb_motion(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-
-	// flag_cb++; // eventually create semaphore for this task
-
-	int err = 0;
-	err = paw_read_regs(MOTION_BURST_REG, value, 12);
-
-	if (value[0] & 0x80)
-	{
-		// upload the mouse report
-		del_x = (value[2] << 8 | value[1]);
-		del_y = (value[4] << 8 | value[3]);
-
-		uint8_t temp_x;
-		if (del_x > 32767)
-		{
-			gpio_pin_set_dt(&led, 1);
-			temp_x = -1 * complement(del_x) * 128 / 32768;
-		}
-		else
-		{
-			gpio_pin_set_dt(&led, 0);
-			temp_x = del_x * 128 / 32768;
-		}
-
-		if (del_y > 32767)
-		{
-			temp_y = -1 * complement(del_y) * 128 / 32768;
-		}
-		else
-		{
-			temp_y = del_y * 128 / 32768;
-		}
-		report_usb[1] = temp_x;
-		report_usb[2] = temp_y;
-		report_ble[2] = temp_x;
-		report_ble[3] = temp_y;
-		report_updated = true;
-	}
+	bt_bas_set_battery_level(battery_level);
 }
 
 int main(void)
 {
-	if (!gpio_is_ready_dt(&led) || !gpio_is_ready_dt(&motion_pin) || !gpio_is_ready_dt(&ncs_pin))
+	int err;
+
+	printk("Starting Bluetooth Peripheral HIDS mouse example\n");
+
+	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED))
 	{
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err)
+		{
+			printk("Failed to register authorization callbacks.\n");
+			return 0;
+		}
+
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err)
+		{
+			printk("Failed to register authorization info callbacks.\n");
+			return 0;
+		}
+	}
+
+	/* DIS initialized at system boot with SYS_INIT macro. */
+	hid_init();
+
+	err = bt_enable(NULL);
+	if (err)
+	{
+		printk("Bluetooth init failed (err %d)\n", err);
 		return 0;
 	}
-	if (!spi_is_ready_dt(&spispec))
+
+	printk("Bluetooth initialized\n");
+
+	// k_work_init(&hids_work, mouse_handler);
+	k_work_init(&adv_work, advertising_process);
+	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED))
 	{
-		printk("Error: SPI device is not ready");
-		return 0;
+		k_work_init(&pairing_work, pairing_process);
 	}
+
+	if (IS_ENABLED(CONFIG_SETTINGS))
+	{
+		settings_load();
+	}
+
+	advertising_start();
 
 	if (!device_is_ready(qdec_dev))
 	{
@@ -1054,119 +969,11 @@ int main(void)
 		return 0;
 	}
 
-	gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-	gpio_pin_configure_dt(&ncs_pin, GPIO_OUTPUT);
-	gpio_pin_configure_dt(&nreset_pin, GPIO_OUTPUT_ACTIVE);
-	gpio_pin_configure_dt(&motion_pin, GPIO_INPUT);
-	gpio_pin_configure_dt(&print_pin, GPIO_INPUT);
-
-	gpio_pin_set_dt(&nreset_pin, 1);
-	k_usleep(10);
-	gpio_pin_set_dt(&nreset_pin, 0);
-	power_up_sequence(); // Power on reset for the sensor
-
-	CPI_set(10000, 10000);
-
-	gpio_pin_interrupt_configure_dt(&motion_pin, GPIO_INT_EDGE_TO_ACTIVE);
-	static struct gpio_callback motion_cb_data;
-	uint8_t val[1];
-	paw_read_regs(0x02, val, 1);
-
-	gpio_init_callback(&motion_cb_data, cb_motion, BIT(motion_pin.pin));
-	gpio_add_callback(motion_pin.port, &motion_cb_data);
-
-	int err;
-	if (bt_mode)
-	{
-		printk("Starting Bluetooth Peripheral HIDS mouse example\n");
-
-		if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED))
-		{
-			err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-			if (err)
-			{
-				printk("Failed to register authorization callbacks.\n");
-				return;
-			}
-
-			err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-			if (err)
-			{
-				printk("Failed to register authorization info callbacks.\n");
-				return;
-			}
-		}
-
-		/* DIS initialized at system boot with SYS_INIT macro. */
-		hid_init();
-
-		err = bt_enable(NULL);
-		if (err)
-		{
-			printk("Bluetooth init failed (err %d)\n", err);
-			return;
-		}
-
-		printk("Bluetooth initialized\n");
-
-		// k_work_init(&hids_work, mouse_handler);
-		k_work_init(&adv_work, advertising_process);
-		if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED))
-		{
-			k_work_init(&pairing_work, pairing_process);
-		}
-
-		if (IS_ENABLED(CONFIG_SETTINGS))
-		{
-			settings_load();
-		}
-	}
+	// configure_buttons();
 
 	while (1)
 	{
 		qdec_fetch_and_handle();
-
-		// if (flag_cb)
-		// {
-
-		// 	int err = 0;
-		// 	err = paw_read_regs(MOTION_BURST_REG, value, 12);
-
-		// 	if (value[0] & 0x80)
-		// 	{
-		// 		// upload the mouse report
-		// 		del_x = (value[2] << 8 | value[1]);
-		// 		del_y = (value[4] << 8 | value[3]);
-
-		// 		uint8_t temp_x;
-		// 		if (del_x > 32767)
-		// 		{
-		// 			gpio_pin_set_dt(&led, 1);
-		// 			temp_x = -1 * complement(del_x) * 128 / 32768;
-		// 		}
-		// 		else
-		// 		{
-		// 			gpio_pin_set_dt(&led, 0);
-		// 			temp_x = del_x * 128 / 32768;
-		// 		}
-
-		// 		if (del_y > 32767)
-		// 		{
-		// 			// gpio_pin_set_dt(&led,1);
-		// 			temp_y = -1 * complement(del_y) * 128 / 32768;
-		// 		}
-		// 		else
-		// 		{
-		// 			// gpio_pin_set_dt(&led,0);
-		// 			temp_y = del_y * 128 / 32768;
-		// 		}
-		// 		report_usb[MOUSE_X_REPORT_IDX] = temp_x;
-		// 		report_usb[MOUSE_Y_REPORT_IDX] = temp_y;
-		// 		report_updated = ture;
-		// 		// err = hid_int_ep_write(hid_dev, report_usb, sizeof(report), NULL);
-		// 	}
-		// 	flag_cb--;
-		// }
 
 		if (report_updated)
 		{
@@ -1199,7 +1006,7 @@ int main(void)
 			memset(report_usb, 0, sizeof(report_usb));
 			report_updated = false;
 		}
-		k_usleep(10);
+		k_msleep(10);
 	}
 	/* Battery level simulation */
 	// bas_notify();

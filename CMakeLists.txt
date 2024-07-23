@@ -10,7 +10,9 @@ project(peripheral_hids_mouse_buttons_only)
 
 FILE(GLOB app_sources src/*.c)
 # NORDIC SDK APP START
-target_sources(app PRIVATE ${app_sources})
+target_sources(app PRIVATE src/main.c src/radio_config.c)
+target_sources(app PRIVATE src/sensor_func.c)
+target_include_directories(app PRIVATE include)
 # NORDIC SDK APP END
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
